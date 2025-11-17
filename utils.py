@@ -6,6 +6,7 @@ from pytrends.request import TrendReq
 from datetime import datetime, date, timedelta
 import time
 import base64
+import google.generativeai as genai
 
 # =======================================================
 # FUNÇÕES DE BUSCA DE DADOS
@@ -30,7 +31,7 @@ def fetch_tiktok_data(term):
         st.warning("Chaves da API do TikTok não configuradas. Pulando busca no TikTok.")
         return None
 
-    url = f"https://{TIKTOK_HOST}/feed/search?keywords={term}&count=20"
+    url = f"https://{TIKTOK_HOST}/feed/search?keywords={term}&count=50"
     headers = {
         'x-rapidapi-key': API_KEY,
         'x-rapidapi-host': TIKTOK_HOST
@@ -49,55 +50,13 @@ def fetch_tiktok_data(term):
         st.error(f"Erro inesperado ao processar dados do TikTok: {e}")
         return None
 
-
-@st.cache_data(ttl=86400)
-def fetch_google_trends(term, time_period, geo):
-    """
-    Busca dados no Google Trends com cache de 24 horas.
-
-    :param term: O termo de pesquisa.
-    :param time_period: O período de tempo.
-    :param geo: A localização.
-    :return: Um dicionário contendo DataFrames ou uma chave 'error'.
-    """
-    try:
-        pytrends = TrendReq(hl='pt-BR', tz=360)
-        keywords = [term]
-        pytrends.build_payload(keywords, cat=0, timeframe=time_period, geo=geo, gprop='')
-        time.sleep(1)
-
-        df_time = pytrends.interest_over_time()
-
-        if df_time.empty or term not in df_time.columns or df_time[term].max() == 0:
-            return {'error': f"A pesquisa do Google Trends não retornou dados para '{term}'."}
-
-        if 'isPartial' in df_time.columns:
-            df_time = df_time.drop(columns=['isPartial'])
-        df_time.columns = ['interest']
-        df_time = df_time.reset_index()
-
-        # Só busca por região se a geolocalização for um país
-        df_region = pd.DataFrame()
-        if len(geo) <= 2:
-            df_region = pytrends.interest_by_region(resolution='REGION', inc_low_vol=True, inc_geo_code=False)
-            if not df_region.empty:
-                df_region.columns = ['interest']
-                df_region = df_region.sort_values(by='interest', ascending=False).reset_index().rename(columns={'geoName': 'Região'})
-                df_region.set_index('Região', inplace=True)
-
-        related_queries = pytrends.related_queries()
-        top_queries = related_queries.get(term, {}).get('top', pd.DataFrame())
-        rising_queries = related_queries.get(term, {}).get('rising', pd.DataFrame())
-
-        return {
-            'df_time': df_time,
-            'df_region': df_region,
-            'top_queries': top_queries,
-            'rising_queries': rising_queries
-        }
-
-    except Exception as e:
-        return {'error': f"Erro na biblioteca PyTrends (Google Trends). Detalhe: {e}"}
+# Funções do Gemini
+@st.cache_resource(ttl=24 * 3600)
+def get_gemini_model():
+    genai.configure(api_key=st.secrets["google_ai"]["api_key"])
+    model = genai.GenerativeModel(model_name="models/gemini-2.5-pro")
+    
+    return model
 
 # =======================================================
 # FUNÇÕES DE LÓGICA 
@@ -124,19 +83,45 @@ def format_number(num):
 def calculate_growth_metrics(df):
     """
     Calcula as métricas de média diária (14d vs 60d) para o IHP.
+    Retorna também a contagem total de criadores únicos na amostra.
 
     :param df: DataFrame de vídeos do TikTok.
-    :return: Dicionário com as métricas de média, ou None se o df for inválido.
+    :return: Dicionário com as métricas de média e contagem total, ou None se o df for inválido.
     """
-    if df.empty or 'create_time' not in df.columns or 'play_count' not in df.columns:
+    if df is None or df.empty or 'create_time' not in df.columns or 'play_count' not in df.columns:
         return None
 
     today = datetime.now()
     start_14d = today - timedelta(days=14)
     start_60d = today - timedelta(days=60)
 
-    df_14d = df[df['create_time'] >= start_14d]
-    df_60d = df[df['create_time'] >= start_60d]
+    # Garante que create_time seja datetime
+    df['create_time'] = pd.to_datetime(df['create_time'], errors='coerce')
+    
+    # Filtra removendo NaT (Not a Time) que podem ter surgido do coerce
+    df_filtered = df.dropna(subset=['create_time'])
+
+    df_14d = df_filtered[df_filtered['create_time'] >= start_14d]
+    df_60d = df_filtered[df_filtered['create_time'] >= start_60d]
+    
+    # --- CÁLCULO DA DURAÇÃO REAL DA AMOSTRA ---
+    
+    # Calcula a duração REAL do período de 60 dias no dataset
+    days_60d_range = 60.0
+    if not df_60d.empty:
+        min_date_60d = df_60d['create_time'].min()
+        time_diff = today - min_date_60d
+        days_60d_range = max(1.0, min(60.0, time_diff.total_seconds() / (24 * 3600)))
+        
+    # Calcula a duração REAL do período de 14 dias no dataset
+    days_14d_range = 14.0
+    if not df_14d.empty:
+        min_date_14d = df_14d['create_time'].min()
+        time_diff = today - min_date_14d
+        days_14d_range = max(1.0, min(14.0, time_diff.total_seconds() / (24 * 3600)))
+    
+    # --- FIM DO CÁLCULO DA DURAÇÃO REAL ---
+
 
     # Somas
     views_sum_14d = df_14d['play_count'].sum()
@@ -148,48 +133,46 @@ def calculate_growth_metrics(df):
     shares_sum_14d = df_14d['share_count'].sum() if 'share_count' in df_14d.columns else 0
     shares_sum_60d = df_60d['share_count'].sum() if 'share_count' in df_60d.columns else 0
 
-    # Médias diárias (Soma / N dias).
-    # Usamos 14.0 e 60.0 fixos para normalizar a média diária.
-    return {
-        'views_14d_avg': views_sum_14d / 14.0,
-        'views_60d_avg': views_sum_60d / 60.0,
-        'likes_14d_avg': likes_sum_14d / 14.0,
-        'likes_60d_avg': likes_sum_60d / 60.0,
-        'comments_14d_avg': comments_sum_14d / 14.0,
-        'comments_60d_avg': comments_sum_60d / 60.0,
-        'shares_14d_avg': shares_sum_14d / 14.0,
-        'shares_60d_avg': shares_sum_60d / 60.0,
-    }
+    # Contagem de Criadores Únicos
+    # 1. Total de criadores únicos na AMOSTRA COMPLETA 
+    total_unique_creators = 0
+    if 'author_user_id' in df_filtered.columns:
+        total_unique_creators = df_filtered.dropna(subset=['author_user_id'])['author_user_id'].nunique()
+        
+    # 2. Criadores Únicos no período (para o UCM momentum)
+    unique_creators_14d = 0
+    if 'author_user_id' in df_14d.columns:
+        unique_creators_14d = df_14d.dropna(subset=['author_user_id'])['author_user_id'].nunique()
+
+    unique_creators_60d = 0
+    if 'author_user_id' in df_60d.columns:
+        unique_creators_60d = df_60d.dropna(subset=['author_user_id'])['author_user_id'].nunique()
 
 
-def calculate_trends_metrics(df_trends):
-    """
-    Calcula as médias de 14d e 60d do Google Trends para o IHP.
-
-    :param df_trends: DataFrame do Google Trends (deve cobrir 60d).
-    :return: Dicionário com as métricas de média, ou None se o df for inválido.
-    """
-    if df_trends is None or df_trends.empty:
-        return None
-
-    today = datetime.now().date()
-    start_14d = today - timedelta(days=14)
-    start_60d = today - timedelta(days=60)
-
-    # Converte 'date' para date objects para comparação
-    df_trends['date_only'] = pd.to_datetime(df_trends['date']).dt.date
-
-    df_14d = df_trends[df_trends['date_only'] >= start_14d]
-    df_60d = df_trends[df_trends['date_only'] >= start_60d]
-
-    # Calcula a média de 'interest' para os períodos
-    trends_14d_avg = df_14d['interest'].mean() if not df_14d.empty else 0
-    trends_60d_avg = df_60d['interest'].mean() if not df_60d.empty else 0
+    # Médias diárias (Soma / N dias). 
+    days_14d_norm = days_14d_range if days_14d_range >= 1.0 else 1.0
+    days_60d_norm = days_60d_range if days_60d_range >= 1.0 else 1.0
 
     return {
-        'trends_14d_avg': trends_14d_avg,
-        'trends_60d_avg': trends_60d_avg,
+        # Engajamento por Dia
+        'views_14d_avg': views_sum_14d / days_14d_norm,
+        'views_60d_avg': views_sum_60d / days_60d_norm,
+        'likes_14d_avg': likes_sum_14d / days_14d_norm,
+        'likes_60d_avg': likes_sum_60d / days_60d_norm,
+        'comments_14d_avg': comments_sum_14d / days_14d_norm,
+        'comments_60d_avg': comments_sum_60d / days_60d_norm,
+        'shares_14d_avg': shares_sum_14d / days_14d_norm,
+        'shares_60d_avg': shares_sum_60d / days_60d_norm,
+        
+        # Criadores Únicos por Dia (UCM Momentum)
+        'creators_14d_avg': unique_creators_14d / days_14d_norm,
+        'creators_60d_avg': unique_creators_60d / days_60d_norm,
+        
+        # Criadores Únicos na Amostra Total (para FD)
+        'total_unique_creators': total_unique_creators,
+        'total_videos_count': len(df_filtered) 
     }
+
 
 def get_momentum_score(recent_avg, historical_avg):
     """
@@ -201,8 +184,11 @@ def get_momentum_score(recent_avg, historical_avg):
     :return: Pontuação de momentum (float) entre 0 e 200.
     """
     # Trata divisão por zero: se o histórico era 0 e o recente é > 0, é hype máximo.
-    if historical_avg == 0:
+    if historical_avg == 0 or pd.isna(historical_avg):
         return 200.0 if recent_avg > 0 else 0.0
+    
+    if pd.isna(recent_avg):
+        recent_avg = 0.0
 
     ratio = recent_avg / historical_avg
     capped_ratio = min(ratio, 2.0)  # Limita em 2x (200%)
@@ -210,16 +196,18 @@ def get_momentum_score(recent_avg, historical_avg):
     return score
 
 
-def calculate_ihp(tiktok_metrics, trends_metrics):
+def calculate_ihp(tiktok_metrics):
     """
-    Calcula o Índice de Hype do Produto (IHP) com base no momentum
-    de 14d vs 60d e pesos pré-definidos.
+    Calcula o Índice de Hype do TikTok (IHT) focado em Organicidade.
+
+    Fórmula atualizada foca em:
+    1. Momentum de Engajamento de Qualidade (Comentários e Shares)
+    2. Fator de Distribuição (FD): Quantos criadores únicos existem na amostra vídeos.
 
     :param tiktok_metrics: Dicionário retornado por `calculate_growth_metrics`.
-    :param trends_metrics: Dicionário retornado por `calculate_trends_metrics`.
-    :return: Dicionário com a pontuação IHP final e os scores de momentum.
+    :return: Dicionário com a pontuação IHT final e os scores de momentum.
     """
-    # Pega os dados do TikTok. Se não existirem, usa 0.
+    # Pega os dados do TikTok. Se não existirem (None), usa 0.
     tm = tiktok_metrics or {}
     views_14d_avg = tm.get('views_14d_avg', 0)
     views_60d_avg = tm.get('views_60d_avg', 0)
@@ -229,35 +217,56 @@ def calculate_ihp(tiktok_metrics, trends_metrics):
     comments_60d_avg = tm.get('comments_60d_avg', 0)
     shares_14d_avg = tm.get('shares_14d_avg', 0)
     shares_60d_avg = tm.get('shares_60d_avg', 0)
+    creators_14d_avg = tm.get('creators_14d_avg', 0)
+    creators_60d_avg = tm.get('creators_60d_avg', 0)
+    
+    total_unique_creators = tm.get('total_unique_creators', 0)
+    total_videos_count = tm.get('total_videos_count', 1) # Mínimo 1 para evitar divisão por zero
 
-    # Pega os dados do Trends. Se não existirem, usa 0.
-    trm = trends_metrics or {}
-    trends_14d_avg = trm.get('trends_14d_avg', 0)
-    trends_60d_avg = trm.get('trends_60d_avg', 0)
+    # --- 1. CÁLCULO DO FATOR DE DISTRIBUIÇÃO (FD) ---
+    # Pontuação de 0 a 100, baseado na proporção de criadores únicos na amostra de vídeos.
+    # Ex: 50 criadores em 50 vídeos = FD de 100 (alta organicidade/pulverização)
+    # Ex: 5 criadores em 50 vídeos = FD de 10 (baixa distribuição)
+    distribution_ratio = total_unique_creators / total_videos_count
+    FD_score = min(distribution_ratio * 100, 100) # Limita a 100
 
-    # Calcula o Momentum Score (0-200) para cada dimensão
-    T_m = get_momentum_score(trends_14d_avg, trends_60d_avg)
+    # --- 2. CÁLCULO DO MOMENTUM SCORE ---
+    # Momentum (14d vs 60d) para cada dimensão (0-200)
     V_m = get_momentum_score(views_14d_avg, views_60d_avg)
     L_m = get_momentum_score(likes_14d_avg, likes_60d_avg)
     C_m = get_momentum_score(comments_14d_avg, comments_60d_avg)
     S_m = get_momentum_score(shares_14d_avg, shares_60d_avg)
+    UCM_m = get_momentum_score(creators_14d_avg, creators_60d_avg) # Momentum de Criadores/Dia
 
-    # Aplica os pesos e calcula o IHP final (escala 0-200)
-    ihp_total_score = (
-        (T_m * 0.30) +
-        (V_m * 0.25) +
-        (L_m * 0.20) +
-        (C_m * 0.15) +
-        (S_m * 0.10)
+    # --- 3. FÓRMULA FINAL (PESO DE ORGANICIDADE) ---
+    # Peso total = 100%. A pontuação máxima continua sendo 200 (se todos os momentos forem 200).
+    # O Fator de Distribuição (FD) agora é uma métrica de base (0-100) que é ponderada.
+    
+    # Pesos (ajustados para 100%)
+    ihp_total_momentum_score = (
+        (C_m * 0.35) +    # Comentários: Engajamento de alta qualidade (35%)
+        (S_m * 0.25) +    # Compartilhamentos: Prova de interesse forte (25%)
+        (UCM_m * 0.15) +  # Momentum de Novos Criadores: Sinal de adoção crescente (15%)
+        (L_m * 0.15) +    # Likes (15%)
+        (V_m * 0.10)      # Views (10%)
     )
+    
+    # Combina o Momentum (14d vs 60d) com o Fator de Distribuição (FD).
+    # O IHT é a média ponderada do Momentum Total e do FD.
+    # Se o Momentum é alto (150) e a Distribuição é baixa (10), a média cai.
+    # IHT (Escala 0-200, onde 100 é o ponto de equilíbrio, e 200 é o máximo teórico)
+    ihp_total_score = (ihp_total_momentum_score * 0.70) + (FD_score * 0.30)
+    ihp_total_score = min(ihp_total_score, 200) # Garante que não ultrapasse 200 
+
 
     return {
         'ihp_total_score': ihp_total_score,
-        'trends_momentum': T_m,
         'views_momentum': V_m,
         'likes_momentum': L_m,
         'comments_momentum': C_m,
         'shares_momentum': S_m,
+        'ucm_momentum': UCM_m,
+        'fd_score': FD_score, 
     }
 
 
@@ -269,13 +278,13 @@ def get_ihp_recommendation(ihp_total_score):
     :return: Uma string de interpretação.
     """
     if ihp_total_score >= 150:
-        return "Viral — tendência explosiva"
+        return "Viral — tendência explosiva e orgânica"
     elif ihp_total_score >= 100:
-        return "Em alta — hype crescendo"
+        return "Em alta — hype crescendo com boa distribuição"
     elif ihp_total_score >= 60:
-        return "Estável — atenção sustentada"
+        return "Estável — atenção sustentada, monitorar distribuição"
     else:
-        return "Interesse em queda — produto esfriando"
+        return "Interesse em queda — produto esfriando ou campanha concentrada"
 
 
 # =======================================================
@@ -349,7 +358,6 @@ def load_css_styles(img_base64, tema_cor):
         padding: 18px;
         text-align: center;
         box-shadow: 0 4px 10px rgba(0,0,0,0.05); 
-        /* Mantemos o transition para os efeitos de hover */
         transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
         height: 100%; 
         display: flex;
@@ -482,6 +490,17 @@ def load_css_styles(img_base64, tema_cor):
         margin-top: 5px;
         margin-bottom: 0px;
         padding: 5px 10px;
+    }}
+    
+    /* Classe de aviso personalizada */
+    .warning-card {{
+        background-color: #fff3cd;
+        color: #856404;
+        padding: 10px;
+        border-radius: 8px;
+        border: 1px solid #ffeeba;
+        margin-top: 10px;
+        font-size: 0.9rem;
     }}
 </style>
 """
